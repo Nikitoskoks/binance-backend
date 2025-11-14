@@ -1,96 +1,147 @@
 import express from "express";
-import axios from "axios";
 import WebSocket from "ws";
+import axios from "axios";
 
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-// 🔥 КЭШ (данные которые выдаём в n8n)
-let funding = null;
-let oi = null;
-let lsr = null;
-let depth = null;
+// ====== КЭШ ======
+const cache = {
+  funding: {},
+  openInterest: {},
+  longShort: {},
+  depth: {},
+};
 
-// =========================
-//   1. Depth via WebSocket
-// =========================
+// ====== Binance API URLs ======
+const URLS = {
+  funding: "https://fapi.binance.com/fapi/v1/fundingRate",
+  openInterest: "https://fapi.binance.com/futures/data/openInterestHist",
+  longShort: "https://fapi.binance.com/futures/data/globalLongShortAccountRatio",
+};
 
-function startDepthWS(symbol = "BTCUSDT") {
-    const ws = new WebSocket(`wss://fstream.binance.com/ws/${symbol.toLowerCase()}@depth20@100ms`);
+// ====== WebSocket DEPTH ======
+const streamSymbol = "btcusdt";
+let ws;
 
-    ws.on("message", msg => {
-        try {
-            const json = JSON.parse(msg.toString());
-            depth = json;
-        } catch (e) {}
-    });
+function startDepthWS() {
+  ws = new WebSocket(`wss://fstream.binance.com/ws/${streamSymbol}@depth@100ms`);
 
-    ws.on("close", () => {
-        console.log("WS closed → reconnecting...");
-        setTimeout(() => startDepthWS(symbol), 2000);
-    });
+  ws.on("message", (msg) => {
+    const data = JSON.parse(msg);
+    cache.depth[streamSymbol.toUpperCase()] = data;
+  });
+
+  ws.on("close", () => {
+    console.log("WS closed, reconnecting...");
+    setTimeout(startDepthWS, 1000);
+  });
+
+  ws.on("error", () => {
+    console.log("WS error → reconnect");
+    ws.close();
+  });
 }
 
 startDepthWS();
 
-// =========================
-//   2. Funding Rate
-// =========================
+// ====== Функция запроса с кэшем ======
+async function fetchWithCache(key, url, params) {
+  const cacheKey = params.symbol;
+  const now = Date.now();
 
-async function updateFunding() {
-    try {
-        const r = await axios.get(
-            "https://fapi.binance.com/fapi/v1/fundingRate?symbol=BTCUSDT&limit=1"
-        );
-        funding = r.data[0];
-    } catch {}
+  // 5 секунд кэша
+  if (
+    cache[key][cacheKey] &&
+    now - cache[key][cacheKey].t < 5000
+  ) {
+    return cache[key][cacheKey].data;
+  }
+
+  const res = await axios.get(url, { params });
+
+  cache[key][cacheKey] = {
+    t: now,
+    data: res.data,
+  };
+
+  return res.data;
 }
-setInterval(updateFunding, 8000);
-updateFunding();
 
-// =========================
-//   3. Open Interest
-// =========================
+// ====== ЭНДПОИНТЫ ======
 
-async function updateOI() {
-    try {
-        const r = await axios.get(
-            "https://fapi.binance.com/futures/data/openInterestHist?symbol=BTCUSDT&period=5m&limit=1"
-        );
-        oi = r.data[0];
-    } catch {}
-}
-setInterval(updateOI, 8000);
-updateOI();
+// FUNDING
+app.get("/funding", async (req, res) => {
+  const symbol = req.query.symbol;
+  if (!symbol) return res.json({ error: "symbol required" });
 
-// =========================
-//   4. Long/Short Ratio
-// =========================
+  const data = await fetchWithCache("funding", URLS.funding, {
+    symbol,
+    limit: 1,
+  });
 
-async function updateLSR() {
-    try {
-        const r = await axios.get(
-            "https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol=BTCUSDT&period=1h&limit=1"
-        );
-        lsr = r.data[0];
-    } catch {}
-}
-setInterval(updateLSR, 8000);
-updateLSR();
-
-// =========================
-//   API ENDPOINTS
-// =========================
-
-app.get("/funding", (req, res) => res.json(funding ?? {}));
-app.get("/oi", (req, res) => res.json(oi ?? {}));
-app.get("/lsr", (req, res) => res.json(lsr ?? {}));
-app.get("/depth", (req, res) => res.json(depth ?? {}));
-
-app.get("/", (req, res) => {
-    res.send("Binance backend is running 🚀");
+  res.json(data);
 });
 
+// OPEN INTEREST
+app.get("/open-interest", async (req, res) => {
+  const symbol = req.query.symbol;
+  if (!symbol) return res.json({ error: "symbol required" });
+
+  const data = await fetchWithCache("openInterest", URLS.openInterest, {
+    symbol,
+    period: "5m",
+    limit: 1,
+  });
+
+  res.json(data);
+});
+
+// LONG / SHORT RATIO
+app.get("/long-short", async (req, res) => {
+  const symbol = req.query.symbol;
+  if (!symbol) return res.json({ error: "symbol required" });
+
+  const data = await fetchWithCache("longShort", URLS.longShort, {
+    symbol,
+    period: "5m",
+    limit: 1,
+  });
+
+  res.json(data);
+});
+
+// DEPTH (из WebSocket)
+app.get("/depth", (req, res) => {
+  const sym = req.query.symbol?.toUpperCase();
+
+  if (!sym) return res.json({ error: "symbol required" });
+
+  res.json(cache.depth[sym] || {});
+});
+
+// FULL PACKAGE (все метрики сразу)
+app.get("/full", async (req, res) => {
+  const symbol = req.query.symbol;
+  if (!symbol) return res.json({ error: "symbol required" });
+
+  const [funding, oi, ls] = await Promise.all([
+    fetchWithCache("funding", URLS.funding, { symbol, limit: 1 }),
+    fetchWithCache("openInterest", URLS.openInterest, { symbol, period: "5m", limit: 1 }),
+    fetchWithCache("longShort", URLS.longShort, { symbol, period: "5m", limit: 1 }),
+  ]);
+
+  const depth = cache.depth[symbol.toUpperCase()] || {};
+
+  res.json({
+    funding,
+    openInterest: oi,
+    longShort: ls,
+    depth,
+  });
+});
+
+// ====== START SERVER ======
 app.listen(PORT, () => {
-    console.log("Server running on PORT:", PORT);
+  console.log("Server running on PORT:", PORT);
 });
