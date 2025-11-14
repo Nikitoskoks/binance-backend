@@ -1,129 +1,114 @@
-import express from 'express';
-import axios from 'axios';
-import WebSocket from 'ws';
+import express from "express";
+import axios from "axios";
+import WebSocket from "ws";
+import cors from "cors";
 
 const app = express();
+app.use(cors());
+
 const PORT = process.env.PORT || 10000;
 
-// === ПРОКСИ ===
-const PROXY = "https://corsproxy.io/?";
+// ---- ПРОКСИ ДЛЯ ОБХОДА БЛОКИРОВОК ----
+const PROXY = "https://cors-proxy.fringe.zone/";
 
-// === КЭШ ===
-let depthCache = {};
-let fundingCache = {};
-let oiCache = {};
-let lsCache = {};
+// ---- КЭШ ----
+let cache = {
+  funding: {},
+  openInterest: {},
+  longShort: {},
+  depth: {}
+};
 
-let ws;
-
-// === ФУНКЦИЯ ЧЕРЕЗ ПРОКСИ ===
-async function binanceGET(url) {
-  const full = PROXY + encodeURIComponent(url);
-  const res = await axios.get(full);
-  return res.data;
+// ---- ФУНКЦИЯ ПРОКСИ-ЗАПРОСА ----
+async function proxiedGet(url) {
+  try {
+    const res = await axios.get(PROXY + url, { timeout: 5000 });
+    return res.data;
+  } catch (err) {
+    return null;
+  }
 }
 
-// === WS DEPTH ===
-function startDepthWS(symbol = "BTCUSDT") {
-  const endpoint = `wss://fstream.binance.com/ws/${symbol.toLowerCase()}@depth`;
-  ws = new WebSocket(endpoint);
-
-  ws.on("message", (msg) => {
-    const data = JSON.parse(msg);
-    depthCache[symbol] = data;
-  });
-
-  ws.on("close", () => {
-    console.log("WS closed → reconnecting...");
-    setTimeout(() => startDepthWS(symbol), 2000);
-  });
-
-  ws.on("error", () => {
-    console.log("WS error → reconnecting...");
-    ws.close();
-  });
-}
-
-startDepthWS();
-
-// === ENDPOINTS ===
-
-// Funding
+// ---- FUNDING ----
 app.get("/funding", async (req, res) => {
-  try {
-    const symbol = req.query.symbol || "BTCUSDT";
-    const url = `https://fapi.binance.com/fapi/v1/fundingRate?symbol=${symbol}&limit=1`;
-    const data = await binanceGET(url);
-
-    fundingCache[symbol] = data;
-    res.json(data);
-  } catch (err) {
-    res.json(fundingCache);
-  }
-});
-
-// Open Interest
-app.get("/open-interest", async (req, res) => {
-  try {
-    const symbol = req.query.symbol || "BTCUSDT";
-    const url = `https://fapi.binance.com/futures/data/openInterestHist?symbol=${symbol}&period=5m&limit=1`;
-    const data = await binanceGET(url);
-
-    oiCache[symbol] = data;
-    res.json(data);
-  } catch (err) {
-    res.json(oiCache);
-  }
-});
-
-// Long/Short Ratio
-app.get("/long-short", async (req, res) => {
-  try {
-    const symbol = req.query.symbol || "BTCUSDT";
-    const url = `https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol=${symbol}&period=1h&limit=1`;
-    const data = await binanceGET(url);
-
-    lsCache[symbol] = data;
-    res.json(data);
-  } catch (err) {
-    res.json(lsCache);
-  }
-});
-
-// Depth (WS)
-app.get("/depth", (req, res) => {
   const symbol = req.query.symbol || "BTCUSDT";
-  res.json(depthCache[symbol] || {});
+  if (cache.funding[symbol]) return res.json(cache.funding[symbol]);
+
+  const data = await proxiedGet(
+    `https://fapi.binance.com/fapi/v1/fundingRate?symbol=${symbol}&limit=1`
+  );
+
+  cache.funding[symbol] = data || {};
+  res.json(data || {});
 });
 
-// Full combined endpoint
+// ---- OPEN INTEREST ----
+app.get("/open-interest", async (req, res) => {
+  const symbol = req.query.symbol || "BTCUSDT";
+  if (cache.openInterest[symbol]) return res.json(cache.openInterest[symbol]);
+
+  const data = await proxiedGet(
+    `https://fapi.binance.com/futures/data/openInterestHist?symbol=${symbol}&period=5m&limit=1`
+  );
+
+  cache.openInterest[symbol] = data || {};
+  res.json(data || {});
+});
+
+// ---- LONG/SHORT RATIO ----
+app.get("/long-short", async (req, res) => {
+  const symbol = req.query.symbol || "BTCUSDT";
+  if (cache.longShort[symbol]) return res.json(cache.longShort[symbol]);
+
+  const data = await proxiedGet(
+    `https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol=${symbol}&period=5m&limit=1`
+  );
+
+  cache.longShort[symbol] = data || {};
+  res.json(data || {});
+});
+
+// ---- DEPTH ----
+app.get("/depth", async (req, res) => {
+  const symbol = req.query.symbol || "BTCUSDT";
+
+  const data = await proxiedGet(
+    `https://fapi.binance.com/fapi/v1/depth?symbol=${symbol}&limit=500`
+  );
+
+  cache.depth[symbol] = data || {};
+  res.json(data || {});
+});
+
+// ---- FULL PACKAGE ----
 app.get("/full", async (req, res) => {
   const symbol = req.query.symbol || "BTCUSDT";
 
-  try {
-    const [funding, oi, ls] = await Promise.all([
-      binanceGET(`https://fapi.binance.com/fapi/v1/fundingRate?symbol=${symbol}&limit=1`),
-      binanceGET(`https://fapi.binance.com/futures/data/openInterestHist?symbol=${symbol}&period=5m&limit=1`),
-      binanceGET(`https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol=${symbol}&period=1h&limit=1`)
-    ]);
+  const funding = await proxiedGet(
+    `https://fapi.binance.com/fapi/v1/fundingRate?symbol=${symbol}&limit=1`
+  );
 
-    res.json({
-      funding,
-      openInterest: oi,
-      longShort: ls,
-      depth: depthCache[symbol] || {}
-    });
+  const openInterest = await proxiedGet(
+    `https://fapi.binance.com/futures/data/openInterestHist?symbol=${symbol}&period=5m&limit=1`
+  );
 
-  } catch (err) {
-    res.json({
-      funding: fundingCache[symbol] || {},
-      openInterest: oiCache[symbol] || {},
-      longShort: lsCache[symbol] || {},
-      depth: depthCache[symbol] || {}
-    });
-  }
+  const longShort = await proxiedGet(
+    `https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol=${symbol}&period=5m&limit=1`
+  );
+
+  const depth = await proxiedGet(
+    `https://fapi.binance.com/fapi/v1/depth?symbol=${symbol}&limit=500`
+  );
+
+  res.json({
+    funding: funding || {},
+    openInterest: openInterest || {},
+    longShort: longShort || {},
+    depth: depth || {}
+  });
 });
 
+// ---- СТАРТ ----
 app.listen(PORT, () => {
-  console.log("Server running on PORT:", PORT);
+  console.log("🔥 Backend онлайн на порту:", PORT);
 });
