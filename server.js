@@ -1,147 +1,121 @@
 import express from "express";
-import WebSocket from "ws";
 import axios from "axios";
+import cors from "cors";
+import WebSocket from "ws";
 
 const app = express();
+app.use(cors());
+
 const PORT = process.env.PORT || 10000;
 
-// ====== КЭШ ======
+// ████████████████████████████████████
+// КЭШ
+// ████████████████████████████████████
+
 const cache = {
-  funding: {},
-  openInterest: {},
-  longShort: {},
-  depth: {},
+    funding: {},       
+    openInterest: {},  
+    longShort: {},     
+    depth: {}          
 };
 
-// ====== Binance API URLs ======
-const URLS = {
-  funding: "https://fapi.binance.com/fapi/v1/fundingRate",
-  openInterest: "https://fapi.binance.com/futures/data/openInterestHist",
-  longShort: "https://fapi.binance.com/futures/data/globalLongShortAccountRatio",
-};
+// ████████████████████████████████████
+// Вебсокет Binance — подключение + авто-реконнект
+// ████████████████████████████████████
 
-// ====== WebSocket DEPTH ======
-const streamSymbol = "btcusdt";
-let ws;
+function startDepthSocket(symbol = "BTCUSDT") {
+    const ws = new WebSocket(
+        `wss://fstream.binance.com/ws/${symbol.toLowerCase()}@depth@100ms`
+    );
 
-function startDepthWS() {
-  ws = new WebSocket(`wss://fstream.binance.com/ws/${streamSymbol}@depth@100ms`);
+    ws.on("open", () => console.log("WS CONNECTED:", symbol));
 
-  ws.on("message", (msg) => {
-    const data = JSON.parse(msg);
-    cache.depth[streamSymbol.toUpperCase()] = data;
-  });
+    ws.on("message", (msg) => {
+        try {
+            cache.depth[symbol] = JSON.parse(msg);
+        } catch (e) {}
+    });
 
-  ws.on("close", () => {
-    console.log("WS closed, reconnecting...");
-    setTimeout(startDepthWS, 1000);
-  });
+    ws.on("close", () => {
+        console.log("WS CLOSED. RECONNECTING…");
+        setTimeout(() => startDepthSocket(symbol), 2000);
+    });
 
-  ws.on("error", () => {
-    console.log("WS error → reconnect");
-    ws.close();
-  });
+    ws.on("error", () => {
+        console.log("WS ERROR. RECONNECTING…");
+        ws.close();
+    });
 }
 
-startDepthWS();
+startDepthSocket("BTCUSDT");
 
-// ====== Функция запроса с кэшем ======
-async function fetchWithCache(key, url, params) {
-  const cacheKey = params.symbol;
-  const now = Date.now();
+// ████████████████████████████████████
+// ЭНДПОИНТЫ
+// ████████████████████████████████████
 
-  // 5 секунд кэша
-  if (
-    cache[key][cacheKey] &&
-    now - cache[key][cacheKey].t < 5000
-  ) {
-    return cache[key][cacheKey].data;
-  }
-
-  const res = await axios.get(url, { params });
-
-  cache[key][cacheKey] = {
-    t: now,
-    data: res.data,
-  };
-
-  return res.data;
-}
-
-// ====== ЭНДПОИНТЫ ======
-
-// FUNDING
+// Funding
 app.get("/funding", async (req, res) => {
-  const symbol = req.query.symbol;
-  if (!symbol) return res.json({ error: "symbol required" });
-
-  const data = await fetchWithCache("funding", URLS.funding, {
-    symbol,
-    limit: 1,
-  });
-
-  res.json(data);
+    const symbol = req.query.symbol || "BTCUSDT";
+    try {
+        const r = await axios.get(
+            `https://fapi.binance.com/fapi/v1/fundingRate?symbol=${symbol}&limit=1`
+        );
+        cache.funding[symbol] = r.data[0] || {};
+        res.json(cache.funding[symbol]);
+    } catch (err) {
+        res.json(cache.funding[symbol] || {});
+    }
 });
 
-// OPEN INTEREST
+// Open Interest
 app.get("/open-interest", async (req, res) => {
-  const symbol = req.query.symbol;
-  if (!symbol) return res.json({ error: "symbol required" });
-
-  const data = await fetchWithCache("openInterest", URLS.openInterest, {
-    symbol,
-    period: "5m",
-    limit: 1,
-  });
-
-  res.json(data);
+    const symbol = req.query.symbol || "BTCUSDT";
+    try {
+        const r = await axios.get(
+            `https://fapi.binance.com/fapi/v1/openInterest?symbol=${symbol}`
+        );
+        cache.openInterest[symbol] = r.data || {};
+        res.json(r.data);
+    } catch (err) {
+        res.json(cache.openInterest[symbol] || {});
+    }
 });
 
-// LONG / SHORT RATIO
+// Long/Short Ratio
 app.get("/long-short", async (req, res) => {
-  const symbol = req.query.symbol;
-  if (!symbol) return res.json({ error: "symbol required" });
-
-  const data = await fetchWithCache("longShort", URLS.longShort, {
-    symbol,
-    period: "5m",
-    limit: 1,
-  });
-
-  res.json(data);
+    const symbol = req.query.symbol || "BTCUSDT";
+    try {
+        const r = await axios.get(
+            `https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol=${symbol}&period=1h&limit=1`
+        );
+        cache.longShort[symbol] = r.data[0] || {};
+        res.json(cache.longShort[symbol]);
+    } catch (err) {
+        res.json(cache.longShort[symbol] || {});
+    }
 });
 
-// DEPTH (из WebSocket)
+// Depth (WS)
 app.get("/depth", (req, res) => {
-  const sym = req.query.symbol?.toUpperCase();
-
-  if (!sym) return res.json({ error: "symbol required" });
-
-  res.json(cache.depth[sym] || {});
+    const symbol = req.query.symbol || "BTCUSDT";
+    res.json(cache.depth[symbol] || {});
 });
 
-// FULL PACKAGE (все метрики сразу)
+// Full packet
 app.get("/full", async (req, res) => {
-  const symbol = req.query.symbol;
-  if (!symbol) return res.json({ error: "symbol required" });
-
-  const [funding, oi, ls] = await Promise.all([
-    fetchWithCache("funding", URLS.funding, { symbol, limit: 1 }),
-    fetchWithCache("openInterest", URLS.openInterest, { symbol, period: "5m", limit: 1 }),
-    fetchWithCache("longShort", URLS.longShort, { symbol, period: "5m", limit: 1 }),
-  ]);
-
-  const depth = cache.depth[symbol.toUpperCase()] || {};
-
-  res.json({
-    funding,
-    openInterest: oi,
-    longShort: ls,
-    depth,
-  });
+    const symbol = req.query.symbol || "BTCUSDT";
+    res.json({
+        funding: cache.funding[symbol] || {},
+        openInterest: cache.openInterest[symbol] || {},
+        longShort: cache.longShort[symbol] || {},
+        depth: cache.depth[symbol] || {}
+    });
 });
 
-// ====== START SERVER ======
-app.listen(PORT, () => {
-  console.log("Server running on PORT:", PORT);
-});
+// ████████████████████████████████████
+// START SERVER
+// ████████████████████████████████████
+
+app.listen(PORT, () =>
+    console.log("Server running on port", PORT)
+);
